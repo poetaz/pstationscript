@@ -1,0 +1,696 @@
+
+namespace linnworks.finaware.CommonData.Objects                // leave untouched                            
+{                                                                                               // leave untouched                            
+    public class ShippingLabelMacro : linnworks.scripting.core.IShippingMacro                       // leave untouched                            
+        {                                                                                       // leave untouched                            
+            public List<linnworks.scripting.core.ReturnClass.ShippingLabel> Initialize(linnworks.scripting.core.Debugger debug, SqlConnection ActiveConnection, linnworks.finaware.CommonData.Objects.Order order,linnworks.scripting.core.Classes.OptionCollection ServiceOptions)           // leave untouched                            
+            {                                                                                   // leave untouched                            
+                 // *** COPY FROM THIS LINE ***
+			Log = new Logger(debug, ActivateDebug);
+			string sAuthToken, sClientName;
+			CategoryName = GetUserCategory(ActiveConnection);
+			GetCredentials(ActiveConnection, out sAuthToken, out sClientName);
+			Log.WriteInfo(string.Format("User \"{0}\" Login, using Category {1}: {2}", APIUsername, CategoryName, sAuthToken));
+			if (!string.IsNullOrEmpty(sAuthToken))
+			{
+				return GetLabel(ActiveConnection, sAuthToken, sClientName, order, false);
+			}
+			else
+			{
+				Log.WriteError("Cannot Authorise API");
+			}
+			return new List<linnworks.scripting.core.ReturnClass.ShippingLabel>();
+		}
+
+		// VERSION: 1.6
+		static Logger Log = null;
+		static bool ActivateDebug = false;
+		static string CategoryName = string.Empty;
+
+		// DEV URL - Uncomment ONE Appropriate Endpoint
+		//static string APIURL = "https://www.myparcellabel.com";
+		// LIVE URL - Uncomment ONE Appropriate Endpoint
+		static string APIURL = "https://www.myparcellabel.co.uk";
+
+		// User Credentials
+		static string APIUsername = "shopmonk";
+		static string APIPassword = "Shopmonk123";
+
+		public static List<linnworks.scripting.core.ReturnClass.ShippingLabel> GetLabel(SqlConnection activeConn, string authToken, string clientName, linnworks.finaware.CommonData.Objects.Order order, bool recursive)
+		{
+			List<linnworks.scripting.core.ReturnClass.ShippingLabel> list = new List<linnworks.scripting.core.ReturnClass.ShippingLabel>();
+			try
+			{
+				string sErrorMessage = "";
+				string sURL = string.Format("{0}/CreateLabel", APIURL);
+
+				string sService = GetServiceCode(activeConn, order.ShippingMethod);
+				if (string.IsNullOrEmpty(sService))
+					throw new Exception("Cannot Translate Service from Shipping Method, Terminating");
+				string sCarrier = GetCarrier(activeConn, sService, false);
+				if (string.IsNullOrEmpty(sCarrier))
+					throw new Exception("Cannot Translate Carrier from Service Code, Terminating");
+				Log.WriteInfo(string.Format("CreateLabel: Carrier \"{0}\", Service \"{1}\"", sCarrier, sService));
+
+				System.Net.HttpWebRequest myReq;
+				System.Collections.Specialized.NameValueCollection headers = new System.Collections.Specialized.NameValueCollection();
+				headers.Add("AuthToken", authToken);
+				headers.Add("Carrier", sCarrier);
+
+				string sBody = GetLabelRequest(order, sService, clientName);
+				System.Net.ServicePointManager.ServerCertificateValidationCallback = new System.Net.Security.RemoteCertificateValidationCallback(AcceptMagmaSSLCert);
+				bool bValid = CreateRequest(out myReq, out sErrorMessage, sURL, "POST", sBody, "application/x-www-form-urlencoded", "", headers);
+				if (bValid)
+				{
+					string sResponse = string.Empty;
+					bValid = ExecuteRequest(out sErrorMessage, myReq, out sResponse);
+					if (!bValid)
+					{
+						Log.WriteError(sErrorMessage);
+					}
+					else
+					{
+
+						XmlDocument xDoc = new XmlDocument();
+						xDoc.LoadXml(sResponse);
+						//	Log.WriteInfo(sResponse);
+						XmlNode xNode = xDoc.SelectSingleNode("CreateLabelResponse/Status");
+						if ((xNode != null) && (xNode.InnerText == "Success"))
+						{
+							XmlNodeList xList = xDoc.SelectNodes("CreateLabelResponse/Labels/Label");
+							if (xList != null)
+							{
+								int iLabelCount = 1;
+								foreach (XmlNode xLabel in xList)
+								{
+									string sBase64 = xLabel.InnerText;
+									byte[] bImage = System.Convert.FromBase64String(sBase64);
+									System.IO.MemoryStream stream = new System.IO.MemoryStream(bImage);
+									System.Drawing.Image img = System.Drawing.Image.FromStream(stream);
+									string sConsignment = xLabel.Attributes["ConsignmentNumber"].Value;
+									//Log.WriteInfo(string.Format("Consignment Number: {0}", sConsignment));
+									list.Add(new linnworks.scripting.core.ReturnClass.ShippingLabel(sConsignment, "", img));
+									iLabelCount++;
+								}
+							}
+						}
+						else if ((xNode != null) && (xNode.InnerText == "Failed"))
+						{
+							XmlNodeList xList = xDoc.SelectNodes("CreateLabelResponse/Errors/ResponseError");
+							if ((xList != null) && (xList.Count > 0))
+							{
+								xNode = xList[0].SelectSingleNode("ErrorDescription");
+								if (xNode != null)
+								{
+									Log.WriteError(string.Format("Failed GetLabel: {0}", xNode.InnerText));
+									if (xNode.InnerText == "Unauthorised")
+									{
+										Log.WriteInfo("Failed Authorisation, Reauthorising against Magma Server");
+										string sAuthToken, sClientName;
+										Authenticate(activeConn, out sAuthToken, out sClientName);
+										UpdateCredentials(activeConn, sAuthToken, sClientName);
+										if (!recursive)
+											return GetLabel(activeConn, sAuthToken, sClientName, order, false);
+										else
+											Log.WriteError("Failed Recursive Authorisation");
+									}
+								}
+							}
+						}
+						else
+							Log.WriteError("Failed GetLabel");
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return list;
+		}
+
+		private static string GetUserCategory(SqlConnection activeConn)
+		{
+			string sResult = "";
+			try
+			{
+				string sSQL = string.Format("select settingValue from AppSettings where settingName = '{0}' and settingCategory = 'MAGMAUSR'", APIUsername);
+				System.Data.SqlClient.SqlCommand cmd = new System.Data.SqlClient.SqlCommand(sSQL, activeConn);
+				object oResult = cmd.ExecuteScalar();
+				if (oResult == null)
+				{
+					// Get the count
+					sSQL = "select count(1) from AppSettings where settingCategory = 'MAGMAUSR'";
+					cmd = new System.Data.SqlClient.SqlCommand(sSQL, activeConn);
+					oResult = cmd.ExecuteScalar();
+					int iCount = 0;
+					if (oResult != null)
+						iCount = int.Parse(oResult.ToString());
+					// Insert the value
+					sResult = string.Format("MAGMAUSR{0}", (iCount + 1));
+					sSQL = string.Format("insert into AppSettings (settingName, settingValue, settingCategory) values ('{0}', '{1}', 'MAGMAUSR')", APIUsername, sResult);
+					List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms, activeConn);
+				}
+				else
+					sResult = oResult.ToString();
+				Log.WriteInfo(sResult);
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return sResult;
+		}
+
+		public static string GetLabelRequest(linnworks.finaware.CommonData.Objects.Order order, string service, string clientName)
+		{
+			System.Text.StringBuilder sb = new System.Text.StringBuilder();
+			string sDesc = string.Empty;
+			if (order.OrderItems.Count > 0)
+				for (int i = 0; i < order.OrderItems.Count; i++)
+					sDesc = string.Format("{0}{1}", ((string.IsNullOrEmpty(sDesc)) ? "" : ","), order.OrderItems[i].ToString());
+			sb.AppendFormat("<CreateLabelRequest><IntegrationType>Linnworks</IntegrationType><ConsignmentDetail><Customer><ConsigneeName>{0}</ConsigneeName>", GetCDataSection(order.FullName.ToString()));
+			sb.AppendFormat("<AddressLine1>{0}</AddressLine1><AddressLine2>{1}</AddressLine2><AddressLine3>{2}</AddressLine3>", GetCDataSection(order.Address1.ToString()), GetCDataSection(order.Address2.ToString()), GetCDataSection(order.Address3.ToString()));
+			sb.AppendFormat("<Town>{0}</Town><City /><County>{1}</County><Postcode>{2}</Postcode>", GetCDataSection(order.Town.ToString()), GetCDataSection(order.Region.ToString()), order.PostCode);
+			sb.AppendFormat("<CountryCode>{0}</CountryCode><HomePhoneNo>{1}</HomePhoneNo><MobilePhoneNo />", order.CountryCode, GetCDataSection(order.BuyerPhoneNumber));
+			sb.AppendFormat("<EmailAddress>{0}</EmailAddress><CustomerReference1>{1}</CustomerReference1>", GetCDataSection(order.EmailAddress.ToString()), GetCDataSection(order.OrderId.ToString()));
+			sb.AppendFormat("<CustomerReference2>{0}</CustomerReference2></Customer>", clientName);
+			sb.AppendFormat("<Parcel><Weight>{0}</Weight><Girth /><DeliveryMessage /><Currency>{1}</Currency>", order.Pack_TotalWeight, order.Currency);
+			sb.AppendFormat("<Value>{0}</Value><NoOfItems>1</NoOfItems><CountryOfOrigin>GB</CountryOfOrigin>", order.TotalCharge);
+			sb.AppendFormat("<Service>{0}</Service><DespatchDate>24062015</DespatchDate><SafePlace /><Contents>{1}</Contents>", service, GetCDataSection(sDesc));
+			sb.AppendFormat("<DeliveryConfirmation>1</DeliveryConfirmation><ExtendedCover>0</ExtendedCover>", GetCDataSection(order.FullName.ToString()));
+			sb.AppendFormat("<ConfirmationEmail>{0}</ConfirmationEmail>", GetCDataSection(order.EmailAddress.ToString()));
+			sb.AppendFormat("<ConfirmationMobile>{0}</ConfirmationMobile></Parcel>", GetCDataSection(order.BuyerPhoneNumber.ToString()));
+			sb.Append("</ConsignmentDetail></CreateLabelRequest>");
+			return sb.ToString();
+		}
+
+		public static string GetCDataSection(string value)
+		{
+			string sResult = string.Format("<![CDATA[{0}]]>", value);
+			return sResult;
+		}
+
+		public static string GetServiceCode(SqlConnection activeConn, string service)
+		{
+			string sResult = service;
+			try
+			{
+				Guid ShippingId = linnworks.finaware.CommonData.Postage.GetPostageServiceByName(activeConn, service);
+				string sSQL = string.Format("select PostalServiceCode from PostalServices where pkPostalServiceID = '{0}'", ShippingId.ToString());
+				System.Data.SqlClient.SqlCommand cmd = new System.Data.SqlClient.SqlCommand(sSQL, activeConn);
+				object oResult = cmd.ExecuteScalar();
+				sResult = oResult.ToString();
+				Log.WriteInfo(sResult);
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return sResult;
+		}
+
+		public static string GetCarrierListVersion(SqlConnection activeConn)
+		{
+			string sResult = "-1";
+			try
+			{
+				string sSQL = string.Format("select settingValue from AppSettings where settingName = 'SERVICEVERSION' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+				System.Data.SqlClient.SqlCommand cmd = new System.Data.SqlClient.SqlCommand(sSQL, activeConn);
+				object oResult = cmd.ExecuteScalar();
+				if (oResult != null)
+				{
+					sResult = oResult.ToString();
+					// Just make sure the SERVICELIST isn't NULL/Empty
+					sSQL = string.Format("select settingValue from AppSettings where settingName = 'SERVICELIST' and settingCategory = '{0}'", CategoryName);
+					cmd = new System.Data.SqlClient.SqlCommand(sSQL, activeConn);
+					oResult = cmd.ExecuteScalar();
+					if (oResult != null)
+					{
+						if (string.IsNullOrEmpty(oResult.ToString()))
+							sResult = "-1";
+					}
+					else
+						sResult = "-1";
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			Log.WriteInfo(string.Format("CarrierListVersion: {0}", sResult));
+			return sResult;
+		}
+
+		public static string GetCarrier(SqlConnection activeConn, string service, bool recursive)
+		{
+			string sResult = "";
+			string authToken = "";
+			string clientName = "";
+			try
+			{
+				string sSQL = string.Format("select settingValue from AppSettings where settingName = 'SERVICELIST' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+				System.Data.SqlClient.SqlCommand cmd = new System.Data.SqlClient.SqlCommand(sSQL, activeConn);
+				object oResult = cmd.ExecuteScalar();
+				if (oResult != null)
+				{
+					string sXML = oResult.ToString();
+					//Log.WriteInfo(sXML);
+					if (!string.IsNullOrEmpty(sXML))
+					{
+						System.Xml.XmlDocument xDoc = new System.Xml.XmlDocument();
+						xDoc.LoadXml(sXML);
+						if (xDoc != null)
+						{
+							System.Xml.XmlNodeList xNodes = xDoc.SelectNodes("ServiceList/Carrier/Service");
+							foreach (System.Xml.XmlNode xNode in xNodes)
+							{
+								System.Xml.XmlAttribute xAttr = xNode.Attributes["StartsWith"];
+								if ((xAttr != null) && (service.StartsWith(xAttr.Value)))
+								{
+									System.Xml.XmlNode xParent = xNode.ParentNode;
+									if (xParent.Attributes["Name"] != null)
+									{
+										sResult = xParent.Attributes["Name"].Value;
+										break;
+									}
+								}
+							}
+						}
+					}
+					else
+					{
+						if (!recursive)
+						{
+							Authenticate(activeConn, out authToken, out clientName);
+							UpdateCredentials(activeConn, authToken, clientName);
+							sResult = GetCarrier(activeConn, service, true);
+						}
+						else
+							throw new Exception("GetCarrier: DB Value Exists but is NULL/Empty");
+					}
+				}
+				else
+				{
+					if (!recursive)
+					{
+						Authenticate(activeConn, out authToken, out clientName);
+						UpdateCredentials(activeConn, authToken, clientName);
+						sResult = GetCarrier(activeConn, service, true);
+					}
+					else
+						throw new Exception("GetCarrier: DB Value Exists but is NULL/Empty");
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return sResult;
+		}
+
+		public static void Authenticate(SqlConnection activeConn, out string authToken, out string clientName)
+		{
+			authToken = string.Empty;
+			clientName = string.Empty;
+			try
+			{
+				string sSQL = string.Format("delete AppSettings where settingName = 'APIAuthToken' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+				CodeHelper.ExecuteDataQuery(sSQL, parms, activeConn);
+
+				System.Net.HttpWebRequest request = null;
+				string sErrorMessage = string.Empty;
+				System.Collections.Specialized.NameValueCollection headers = new System.Collections.Specialized.NameValueCollection();
+				string sCreds = TranslateCredentials(APIUsername, APIPassword, true);
+				headers.Add("Authorization", sCreds);
+				string sServiceVersion = GetCarrierListVersion(activeConn);
+				headers.Add("LinnworksServiceVersion", sServiceVersion);
+
+				System.Net.ServicePointManager.ServerCertificateValidationCallback = new System.Net.Security.RemoteCertificateValidationCallback(AcceptMagmaSSLCert);
+				string sURL = string.Format("{0}/Login", APIURL);
+				bool bValid = CreateRequest(out request, out sErrorMessage, sURL, "GET", "", "", "", headers);
+				if (bValid)
+				{
+					string sResponse = string.Empty;
+					bValid = ExecuteRequest(out sErrorMessage, request, out sResponse);
+					if ((bValid) && (!string.IsNullOrEmpty(sResponse)))
+					{
+						XmlDocument xDoc = new XmlDocument();
+						xDoc.LoadXml(sResponse);
+						XmlNode node = xDoc.SelectSingleNode("APILoginResult/Status");
+						Log.WriteInfo(xDoc.InnerXml);
+						if (node != null)
+						{
+							if (node.InnerText == "Success")
+							{
+								node = xDoc.SelectSingleNode("APILoginResult/AuthToken");
+								if (node != null)
+								{
+									authToken = node.InnerText;
+								}
+								node = xDoc.SelectSingleNode("APILoginResult/ClientName");
+								if (node != null)
+								{
+									clientName = node.InnerText;
+								}
+								node = xDoc.SelectSingleNode("APILoginResult/ServiceList");
+								if (node != null)
+								{
+									string sEnc = node.InnerText;
+									if (!string.IsNullOrEmpty(sEnc))
+									{
+										byte[] bXml = Convert.FromBase64String(sEnc);
+										string sXml = System.Text.UTF8Encoding.UTF8.GetString(bXml);
+										node = xDoc.SelectSingleNode("APILoginResult/ServiceVersion");
+										string sVersion = node.InnerText;
+										UpdateServiceList(activeConn, sVersion, sXml);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+		}
+
+		public static void UpdateServiceList(SqlConnection activeConn, string version, string serviceList)
+		{
+			try
+			{
+				Log.WriteInfo(string.Format("Updating Service List [v{0}]: {1}", version, serviceList));
+				string sSQL = string.Format("select settingValue from AppSettings where settingName = 'SERVICEVERSION' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+				DataSet ds = CodeHelper.ExecuteDataQuerySet(sSQL, parms, new string[] { "Auth" }, activeConn);
+				if ((ds != null) && (ds.Tables.Count > 0) && (ds.Tables["Auth"] != null) && (ds.Tables["Auth"].Rows.Count > 0))
+				{
+					sSQL = string.Format("update AppSettings set settingValue = '{0}' where settingName = 'SERVICEVERSION' and settingCategory = '{1}'", version, CategoryName);
+					parms = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms, activeConn);
+				}
+				else
+				{
+					sSQL = string.Format("insert into AppSettings (settingName, settingValue, settingCategory) values ('SERVICEVERSION', '{0}', '{1}')", version, CategoryName);
+					parms = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms, activeConn);
+				}
+				sSQL = string.Format("select settingValue from AppSettings where settingName = 'SERVICELIST' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms2 = new List<CodeHelper.DataQueryParameter>();
+				ds = CodeHelper.ExecuteDataQuerySet(sSQL, parms2, new string[] { "Client" }, activeConn);
+				if ((ds != null) && (ds.Tables.Count > 0) && (ds.Tables["Client"] != null) && (ds.Tables["Client"].Rows.Count > 0))
+				{
+					sSQL = string.Format("update AppSettings set settingValue = '{0}' where settingName = 'SERVICELIST' and settingCategory = '{1}'", serviceList, CategoryName);
+					parms2 = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms2, activeConn);
+				}
+				else
+				{
+					sSQL = string.Format("insert into AppSettings (settingName, settingValue, settingCategory) values ('SERVICELIST', '{0}', '{1}')", serviceList, CategoryName);
+					parms2 = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms2, activeConn);
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+		}
+
+		public static bool AcceptMagmaSSLCert(object sender, System.Security.Cryptography.X509Certificates.X509Certificate cert,
+			System.Security.Cryptography.X509Certificates.X509Chain chain, System.Net.Security.SslPolicyErrors errors)
+		{
+			return true;
+		}
+
+		public static string TranslateCredentials(string username, string password, bool addBasic)
+		{
+			string sResult = string.Empty;
+			try
+			{
+				string sUserPass = string.Format("{0}:{1}", username, password);
+				string sCreds = Convert.ToBase64String(System.Text.Encoding.Default.GetBytes(sUserPass));
+				if (addBasic)
+					sResult = string.Format("Basic {0}", sCreds);
+				else
+					sResult = sCreds;
+			}
+			catch (Exception ex)
+			{
+				sResult = string.Empty;
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return sResult;
+		}
+
+		public static bool CreateRequest(out System.Net.HttpWebRequest request, out string errorMessage, string url, string method,
+		string requestBody, string contentType, string acceptHeader, System.Collections.Specialized.NameValueCollection headers)
+		{
+			bool bResult = false;
+			errorMessage = string.Empty;
+			request = null;
+			try
+			{
+				request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+				request.Method = method;
+				if ((headers != null) && (headers.Count > 0))
+				{
+					foreach (string str in headers)
+						request.Headers.Add(str, headers[str]);
+				}
+				if (!string.IsNullOrEmpty(acceptHeader))
+				{
+					request.Accept = acceptHeader;
+				}
+				if (!string.IsNullOrEmpty(contentType))
+				{
+					request.ContentType = contentType;
+				}
+				if (!string.IsNullOrEmpty(requestBody))
+				{
+					byte[] buffer = new byte[0];
+					System.Text.UTF8Encoding enc = new System.Text.UTF8Encoding();
+					buffer = enc.GetBytes(requestBody);
+					request.ContentLength = buffer.Length;
+					System.IO.Stream requestStream = request.GetRequestStream();
+					requestStream.Write(buffer, 0, buffer.Length);
+					requestStream.Close();
+					requestStream.Dispose();
+				}
+				bResult = true;
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return bResult;
+		}
+
+		public static bool ExecuteRequest(out string errorMessage, System.Net.HttpWebRequest request, out string response)
+		{
+			bool bResult = false;
+			errorMessage = string.Empty;
+			response = string.Empty;
+			try
+			{
+				System.Net.HttpWebResponse myResp = (System.Net.HttpWebResponse)request.GetResponse();
+				System.IO.Stream stream = myResp.GetResponseStream();
+
+				// read the content into a string
+				byte[] resp = new byte[32768];
+				System.IO.MemoryStream ms = new System.IO.MemoryStream();
+				int bytesRead = 0, totalBytesRead = 0;
+				do
+				{
+					bytesRead = stream.Read(resp, 0, resp.Length);
+					totalBytesRead += bytesRead;
+
+					ms.Write(resp, 0, bytesRead);
+				} while (bytesRead > 0);
+
+				byte[] bResponse = ms.ToArray();
+				response = System.Text.Encoding.UTF8.GetString(bResponse);
+				bResult = true;
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+			return bResult;
+		}
+
+		public static void UpdateCredentials(SqlConnection activeConn, string authToken, string clientName)
+		{
+			try
+			{
+				string sSQL = string.Format("select settingValue from AppSettings where settingName = 'APIAuthToken' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+				DataSet ds = CodeHelper.ExecuteDataQuerySet(sSQL, parms, new string[] { "Auth" }, activeConn);
+				if ((ds != null) && (ds.Tables.Count > 0) && (ds.Tables["Auth"] != null) && (ds.Tables["Auth"].Rows.Count > 0))
+				{
+					sSQL = string.Format("update AppSettings set settingValue = '{0}' where settingName = 'APIAuthToken' and settingCategory = '{1}'", authToken, CategoryName);
+					parms = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms, activeConn);
+				}
+				else
+				{
+					sSQL = string.Format("insert into AppSettings (settingName, settingValue, settingCategory) values ('APIAuthToken', '{0}', '{1}')", authToken, CategoryName);
+					parms = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms, activeConn);
+				}
+				sSQL = string.Format("select settingValue from AppSettings where settingName = 'APIClientName' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms2 = new List<CodeHelper.DataQueryParameter>();
+				ds = CodeHelper.ExecuteDataQuerySet(sSQL, parms2, new string[] { "Client" }, activeConn);
+				if ((ds != null) && (ds.Tables.Count > 0) && (ds.Tables["Client"] != null) && (ds.Tables["Client"].Rows.Count > 0))
+				{
+					sSQL = string.Format("update AppSettings set settingValue = '{0}' where settingName = 'APIClientName' and settingCategory = '{1}'", clientName, CategoryName);
+					parms2 = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms2, activeConn);
+				}
+				else
+				{
+					sSQL = string.Format("insert into AppSettings (settingName, settingValue, settingCategory) values ('APIClientName', '{0}', '{1}')", clientName, CategoryName);
+					parms2 = new List<CodeHelper.DataQueryParameter>();
+					CodeHelper.ExecuteDataQuery(sSQL, parms2, activeConn);
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+		}
+
+		public static void GetCredentials(SqlConnection activeConn, out string authToken, out string clientName)
+		{
+			authToken = string.Empty;
+			clientName = string.Empty;
+			try
+			{
+				string sSQL = string.Format("select settingValue from AppSettings where settingName = 'APIAuthToken' and settingCategory = '{0}'", CategoryName);
+				List<CodeHelper.DataQueryParameter> parms = new List<CodeHelper.DataQueryParameter>();
+				DataSet ds = CodeHelper.ExecuteDataQuerySet(sSQL, parms, new string[] { "Auth" }, activeConn);
+				if ((ds != null) && (ds.Tables.Count > 0) && (ds.Tables["Auth"] != null) && (ds.Tables["Auth"].Rows.Count > 0))
+				{
+					string sToken = ds.Tables["Auth"].Rows[0]["settingValue"].ToString();
+					if (!string.IsNullOrEmpty(sToken))
+					{
+						authToken = sToken;
+						sSQL = string.Format("select settingValue from AppSettings where settingName = 'APIClientName' and settingCategory = '{0}'", CategoryName);
+						List<CodeHelper.DataQueryParameter> parms2 = new List<CodeHelper.DataQueryParameter>();
+						ds = CodeHelper.ExecuteDataQuerySet(sSQL, parms2, new string[] { "Client" }, activeConn);
+						if ((ds != null) && (ds.Tables.Count > 0) && (ds.Tables["Client"] != null) && (ds.Tables["Client"].Rows.Count > 0))
+						{
+							string sClientName = ds.Tables["Client"].Rows[0]["settingValue"].ToString();
+							clientName = sClientName;
+						}
+						else
+						{
+							Authenticate(activeConn, out authToken, out clientName);
+							UpdateCredentials(activeConn, authToken, clientName);
+						}
+					}
+					else
+					{
+						Authenticate(activeConn, out authToken, out clientName);
+						UpdateCredentials(activeConn, authToken, clientName);
+					}
+				}
+				else
+				{
+					Authenticate(activeConn, out authToken, out clientName);
+					UpdateCredentials(activeConn, authToken, clientName);
+				}
+			}
+			catch (Exception ex)
+			{
+				string sMessage = ex.ToString();
+				Log.WriteError(sMessage);
+			}
+		}
+
+		public static string GetCommonDirectory()
+		{
+			string sResult = string.Format(@"{0}\Magma Trading Ltd\Linnworks", System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData));
+			if (!System.IO.Directory.Exists(sResult))
+			{
+				System.IO.Directory.CreateDirectory(sResult);
+			}
+			return sResult;
+		}
+
+		public static string GetLogLocation()
+		{
+			string sResult = string.Format(@"{0}\Log", GetCommonDirectory());
+			if (!System.IO.Directory.Exists(sResult))
+			{
+				System.IO.Directory.CreateDirectory(sResult);
+			}
+			sResult = string.Format(@"{0}\APILog.txt", sResult);
+			return sResult;
+		}
+
+		public class Logger
+		{
+			private linnworks.scripting.core.Debugger Debug = null;
+			private bool Active = false;
+
+			public Logger(linnworks.scripting.core.Debugger debug, bool activate)
+			{
+				this.Debug = debug;
+				this.Active = activate;
+				string sLocation = GetLogLocation();
+				if (System.IO.File.Exists(sLocation))
+				{
+					System.IO.File.Delete(sLocation);
+				}
+			}
+
+			public void WriteError(string message)
+			{
+				this.Write("Error", message);
+			}
+
+			public void WriteInfo(string message)
+			{
+				this.Write("Info", message);
+			}
+
+			private void Write(string type, string message)
+			{
+				if (this.Active)
+				{
+					this.Debug.AddEntry(message);
+					string sLocation = GetLogLocation();
+					using (System.IO.StreamWriter sw = System.IO.File.AppendText(sLocation))
+					{
+						sw.WriteLine("~~~ {0} {1}: {2}", DateTime.Now.ToString("ddMMyyyy HH:mm:ss"), type, message);
+					}
+				}
+
+			}
+		}
+
+		// I've put this in to tie up with syntax formating; some lines in Linnworks editor are read-only
+		public static void EmptyMethod()
+		{
+			// *** COPY TO THIS LINE, OVERWRITE "YOUR CODE HERE" SECTION IN INITIALISE ***
+            }                                                                                   // leave untouched                            
+    }                                                                                           // leave untouched                            
+}                                                                                               // leave untouched               
